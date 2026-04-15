@@ -1,12 +1,12 @@
 stream_df = (spark.readStream
-    .format("cloudFiles")
-    .option("cloudFiles.format", "delta")
-    .load("fraud_demo.transactions.raw"))
+    .format("delta")
+    .table("fraud_demo.transactions.raw"))
 
 query = (stream_df.writeStream
     .format("delta")
     .option("checkpointLocation", "/tmp/fraud_checkpoint")
     .outputMode("append")
+    .trigger(availableNow=True)
     .toTable("fraud_demo.transactions.streaming_raw"))
 
 query.awaitTermination(30)
