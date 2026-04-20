@@ -128,60 +128,50 @@ def sanctions_quarantine():
            .withColumn("quarantine_ts",     F.current_timestamp())
            .withColumn("quarantine_status", F.lit("PENDING_REVIEW"))
     )
+
 @dlt.table(
     name    = "sanction_files_audit",
     comment = "Quality metrics for both reference file streams per run",
     table_properties = {"quality": "audit"}
 )
 def reference_files_audit():
-    import json
-    from datetime import datetime, timezone
+    san_raw        = spark.read.table("sanctions_raw")
+    san_quarantine = spark.read.table("sanctions_quarantine")
 
-    san_raw        = dlt.read("sanctions_raw")
-    san_quarantine = dlt.read("sanctions_quarantine")
-
-    san_total  = san_raw.count()
-    san_bad    = san_quarantine.count()
-    san_q_rate = round(san_bad / san_total * 100, 4) if san_total > 0 else 0.0
-
-    san_files = (
-        san_raw.select("source_file")
-               .distinct().count()
+    counts = (
+        san_raw.agg(
+            F.count("*").alias("sanctions_total_rows"),
+            F.countDistinct("source_file").alias("sanctions_files_processed"),
+        )
+        .crossJoin(san_quarantine.agg(F.count("*").alias("sanctions_quarantine_rows")))
     )
 
-
-    san_failures = (
-        san_quarantine
-        .groupBy("failure_reasons").count()
-        .orderBy(F.desc("count")).limit(5)
-        .toPandas().to_dict("records")
-    ) if san_bad > 0 else []
-
-    status = (
-        "FAIL" if san_total == 0
-                  or san_q_rate > 5.0
-        else "PASS"
+    top_failures = san_quarantine.groupBy("failure_reasons").agg(
+        F.count("*").alias("count")
+    ).orderBy(F.desc("count")).limit(5).agg(
+        F.to_json(F.collect_list(
+            F.struct("failure_reasons", "count")
+        )).alias("sanctions_top_failures")
     )
 
-    from pyspark.sql.types import (
-        StructType, StructField, LongType,
-        DoubleType, StringType, TimestampType
+    return (
+        counts
+        .crossJoin(top_failures)
+        .withColumn("sanctions_quarantine_pct",
+            F.when(F.col("sanctions_total_rows") > 0,
+                   F.round(F.col("sanctions_quarantine_rows") / F.col("sanctions_total_rows") * 100, 4)
+            ).otherwise(F.lit(0.0))
+        )
+        .withColumn("audit_status",
+            F.when(
+                (F.col("sanctions_total_rows") > 0) &
+                (F.col("sanctions_quarantine_pct") <= 5.0),
+                F.lit("PASS")
+            ).otherwise(F.lit("FAIL"))
+        )
+        .select(
+            "sanctions_total_rows", "sanctions_quarantine_rows",
+            "sanctions_quarantine_pct", "sanctions_files_processed",
+            "sanctions_top_failures", "audit_status"
+        )
     )
-    schema = StructType([
-        StructField("sanctions_total_rows",    LongType(),      False),
-        StructField("sanctions_quarantine_rows",LongType(),     False),
-        StructField("sanctions_quarantine_pct",DoubleType(),    False),
-        StructField("sanctions_files_processed",LongType(),     False),
-        StructField("sanctions_top_failures",  StringType(),    True),
-        StructField("audit_status",            StringType(),    False),
-    ])
-
-    return spark.createDataFrame([{
-        "run_ts":                   datetime.now(timezone.utc).replace(tzinfo=None),
-        "sanctions_total_rows":     san_total,
-        "sanctions_quarantine_rows":san_bad,
-        "sanctions_quarantine_pct": san_q_rate,
-        "sanctions_files_processed":san_files,
-        "sanctions_top_failures":   json.dumps(san_failures),
-        "audit_status":             status,
-    }], schema=schema)

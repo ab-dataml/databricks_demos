@@ -77,7 +77,7 @@ def mcc_codes_raw():
 )
 def mcc_codes_quarantine():
     return (
-        dlt.read_stream("mcc_codes_raw")
+        spark.readStream.option("skipChangeCommits", "true").table("mcc_codes_raw")
            .withColumn("failure_reasons", F.concat_ws(", ",
                F.when(F.col("mcc_code").isNull(),
                       F.lit("null_mcc_code")),
@@ -102,54 +102,44 @@ def mcc_codes_quarantine():
     table_properties = {"quality": "audit"}
 )
 def reference_files_audit():
-    import json
-    from datetime import datetime, timezone
+    mcc_raw        = spark.read.table("mcc_codes_raw")
+    mcc_quarantine = spark.read.table("mcc_codes_quarantine")
 
-    mcc_raw        = dlt.read("mcc_codes_raw")
-    mcc_quarantine = dlt.read("mcc_codes_quarantine")
-
-    mcc_total  = mcc_raw.count()
-    mcc_bad    = mcc_quarantine.count()
-    mcc_q_rate = round(mcc_bad / mcc_total * 100, 4) if mcc_total > 0 else 0.0
-
-    mcc_files = (
-        mcc_raw.select("source_file")
-               .distinct().count()
+    counts = (
+        mcc_raw.agg(
+            F.count("*").alias("mcc_total_rows"),
+            F.countDistinct("source_file").alias("mcc_files_processed"),
+        )
+        .crossJoin(mcc_quarantine.agg(F.count("*").alias("mcc_quarantine_rows")))
     )
 
-    mcc_failures = (
-        mcc_quarantine
-        .groupBy("failure_reasons").count()
-        .orderBy(F.desc("count")).limit(5)
-        .toPandas().to_dict("records")
-    ) if mcc_bad > 0 else []
-
-    status = (
-        "FAIL" if mcc_total == 0
-                  or mcc_q_rate > 5.0
-        else "PASS"
+    top_failures = mcc_quarantine.groupBy("failure_reasons").agg(
+        F.count("*").alias("count")
+    ).orderBy(F.desc("count")).limit(5).agg(
+        F.to_json(F.collect_list(
+            F.struct("failure_reasons", "count")
+        )).alias("mcc_top_failures")
     )
 
-    from pyspark.sql.types import (
-        StructType, StructField, LongType,
-        DoubleType, StringType, TimestampType
+    return (
+        counts
+        .crossJoin(top_failures)
+        .withColumn("run_ts", F.current_timestamp())
+        .withColumn("mcc_quarantine_pct",
+            F.when(F.col("mcc_total_rows") > 0,
+                   F.round(F.col("mcc_quarantine_rows") / F.col("mcc_total_rows") * 100, 4)
+            ).otherwise(F.lit(0.0))
+        )
+        .withColumn("audit_status",
+            F.when(
+                (F.col("mcc_total_rows") > 0) &
+                (F.col("mcc_quarantine_pct") <= 5.0),
+                F.lit("PASS")
+            ).otherwise(F.lit("FAIL"))
+        )
+        .select(
+            "run_ts", "mcc_total_rows", "mcc_quarantine_rows",
+            "mcc_quarantine_pct", "mcc_files_processed",
+            "mcc_top_failures", "audit_status"
+        )
     )
-    schema = StructType([
-        StructField("run_ts",                  TimestampType(), False),
-        StructField("mcc_total_rows",          LongType(),      False),
-        StructField("mcc_quarantine_rows",     LongType(),      False),
-        StructField("mcc_quarantine_pct",      DoubleType(),    False),
-        StructField("mcc_files_processed",     LongType(),      False),
-        StructField("mcc_top_failures",        StringType(),    True),
-        StructField("audit_status",            StringType(),    False),
-    ])
-
-    return spark.createDataFrame([{
-        "run_ts":                   datetime.now(timezone.utc).replace(tzinfo=None),
-        "mcc_total_rows":           mcc_total,
-        "mcc_quarantine_rows":      mcc_bad,
-        "mcc_quarantine_pct":       mcc_q_rate,
-        "mcc_files_processed":      mcc_files,
-        "mcc_top_failures":         json.dumps(mcc_failures),
-        "audit_status":             status,
-    }], schema=schema)

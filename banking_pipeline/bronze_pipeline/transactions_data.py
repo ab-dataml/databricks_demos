@@ -111,54 +111,53 @@ def pipeline_audit():
     cleansed   = dlt.read("transactions_cleansed_stage")
     quarantine = dlt.read("transactions_quarantine")
 
-    total      = raw.count()
-    good       = cleansed.count()
-    bad        = quarantine.count()
-    q_rate     = round(bad / total * 100, 4) if total > 0 else 0.0
+    raw_count        = raw.agg(F.count("*").alias("total_rows"))
+    cleansed_count   = cleansed.agg(F.count("*").alias("good_rows"))
+    quarantine_count = quarantine.agg(F.count("*").alias("quarantine_rows"))
+
+    counts = (
+        raw_count
+        .crossJoin(cleansed_count)
+        .crossJoin(quarantine_count)
+        .withColumn("quarantine_pct",
+            F.when(F.col("total_rows") > 0,
+                   F.round(F.col("quarantine_rows").cast("double")
+                           / F.col("total_rows").cast("double") * 100, 4))
+             .otherwise(F.lit(0.0)))
+    )
 
     currency_dist = (
-        raw.groupBy("currency").count()
-           .toPandas()
-           .set_index("currency")["count"]
-           .to_dict()
+        raw.groupBy("currency").agg(F.count("*").alias("cnt"))
+           .agg(F.to_json(F.map_from_arrays(
+               F.collect_list("currency"),
+               F.collect_list("cnt")
+           )).alias("currency_dist"))
     )
 
     top_failures = (
         quarantine
-        .groupBy("failure_reasons").count()
-        .orderBy(F.desc("count"))
+        .groupBy("failure_reasons").agg(F.count("*").alias("cnt"))
+        .orderBy(F.desc("cnt"))
         .limit(5)
-        .toPandas()
-        .to_dict("records")
-    ) if bad > 0 else []
-
-    from pyspark.sql.types import (
-        StructType, StructField, LongType,
-        DoubleType, StringType, TimestampType
+        .agg(F.to_json(F.collect_list(
+            F.struct("failure_reasons", "cnt")
+        )).alias("top_failure_reasons"))
     )
-    audit_schema = StructType([
-        StructField("run_ts",            TimestampType(), False),
-        StructField("total_rows",        LongType(),      False),
-        StructField("good_rows",         LongType(),      False),
-        StructField("quarantine_rows",   LongType(),      False),
-        StructField("quarantine_pct",    DoubleType(),    False),
-        StructField("currency_dist",     StringType(),    True),
-        StructField("top_failure_reasons", StringType(), True),
-        StructField("audit_status",      StringType(),    False),
-    ])
 
-    import json
-    from datetime import datetime, timezone
-
-    status = "PASS" if (total > 0 and q_rate < 10.0) else "FAIL"
-
-    return spark.createDataFrame([{
-        "run_ts":               datetime.now(timezone.utc),
-        "total_rows":           total,
-        "good_rows":            good,
-        "quarantine_rows":      bad,
-        "quarantine_pct":       q_rate,
-        "currency_dist":        json.dumps(currency_dist),
-        "top_failure_reasons":  json.dumps(top_failures),
-        "audit_status":         status,
-    }], schema=audit_schema)
+    return (
+        counts
+        .crossJoin(currency_dist)
+        .crossJoin(top_failures)
+        .select(
+            F.current_timestamp().alias("run_ts"),
+            F.col("total_rows"),
+            F.col("good_rows"),
+            F.col("quarantine_rows"),
+            F.col("quarantine_pct"),
+            F.col("currency_dist"),
+            F.col("top_failure_reasons"),
+            F.when((F.col("total_rows") > 0) & (F.col("quarantine_pct") < 10.0),
+                   F.lit("PASS"))
+             .otherwise(F.lit("FAIL")).alias("audit_status"),
+        )
+    )
