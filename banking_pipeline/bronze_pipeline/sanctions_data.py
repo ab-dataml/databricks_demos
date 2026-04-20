@@ -7,26 +7,6 @@ from pyspark.sql.types import (
 
 SANCTIONS_LANDING_PATH = "s3://fraud-demo-bucket-043309328060-us-east-1-an/reference/sanctions/"
 
-
-SANCTIONS_ENVELOPE_SCHEMA = StructType([
-    StructField("schema_version", StringType(), True),
-    StructField("generated_at",   StringType(), True),
-    StructField("record_count",   StringType(), True),
-    StructField("records", ArrayType(StructType([
-        StructField("entity_id",         StringType(), False),
-        StructField("entity_type",        StringType(), True),
-        StructField("full_name",          StringType(), False),
-        StructField("aliases",            ArrayType(StringType()), True),
-        StructField("country_of_origin",  StringType(), True),
-        StructField("sanctions_program",  StringType(), True),
-        StructField("listed_date",        StringType(), True),
-        StructField("last_updated",       StringType(), True),
-        StructField("is_active",          BooleanType(), True),
-        StructField("risk_score",         DoubleType(),  True),
-        StructField("source_list",        StringType(), True),
-    ])), True),
-])
-
 VALID_ENTITY_TYPES = [
     "INDIVIDUAL","ORGANISATION","VESSEL","AIRCRAFT"
 ]
@@ -34,6 +14,7 @@ VALID_PROGRAMS = [
     "OFAC_SDN","UN_CONSOLIDATED","EU_CONSOLIDATED",
     "HMT_CONSOLIDATED","OFAC_CONSOLIDATED"
 ]
+
 
 @dlt.table(
     name    = "sanctions_raw",
@@ -44,27 +25,45 @@ VALID_PROGRAMS = [
         "pipelines.autoOptimize.managed": "true",
     }
 )
-@dlt.expect("valid_entity_id",
-            "entity_id IS NOT NULL")
-@dlt.expect("valid_full_name",
-            "full_name IS NOT NULL")
+@dlt.expect("valid_entity_id",   "entity_id IS NOT NULL")
+@dlt.expect("valid_full_name",   "full_name IS NOT NULL")
 @dlt.expect("valid_entity_type",
-            "entity_type IN ('INDIVIDUAL','ORGANISATION','VESSEL','AIRCRAFT')")
-@dlt.expect("valid_risk_score",
-            "risk_score BETWEEN 0.0 AND 1.0")
+    "entity_type IN ('INDIVIDUAL','ORGANISATION','VESSEL','AIRCRAFT')")
+@dlt.expect("valid_risk_score",  "risk_score BETWEEN 0.0 AND 1.0")
 @dlt.expect("valid_sanctions_program",
-            "sanctions_program IN ('OFAC_SDN','UN_CONSOLIDATED',"
-            "'EU_CONSOLIDATED','HMT_CONSOLIDATED','OFAC_CONSOLIDATED')")
+    "sanctions_program IN ('OFAC_SDN','UN_CONSOLIDATED',"
+    "'EU_CONSOLIDATED','HMT_CONSOLIDATED','OFAC_CONSOLIDATED')")
 def sanctions_raw():
+    from pyspark.sql.types import ArrayType, DoubleType
+
+    record_schema = StructType([
+        StructField("entity_id",          StringType(),           False),
+        StructField("entity_type",        StringType(),           True),
+        StructField("full_name",          StringType(),           False),
+        StructField("aliases",            ArrayType(StringType()),True),
+        StructField("country_of_origin",  StringType(),           True),
+        StructField("sanctions_program",  StringType(),           True),
+        StructField("listed_date",        StringType(),           True),
+        StructField("last_updated",       StringType(),           True),
+        StructField("is_active",          BooleanType(),          True),
+        StructField("risk_score",         DoubleType(),           True),
+        StructField("source_list",        StringType(),           True),
+    ])
+
+    envelope_schema = StructType([
+        StructField("schema_version", StringType(),              True),
+        StructField("generated_at",   StringType(),              True),
+        StructField("record_count",   StringType(),              True),
+        StructField("records",        ArrayType(record_schema),  True),
+    ])
+
     raw_stream = (
         spark.readStream
              .format("cloudFiles")
-             .option("cloudFiles.format",          "json")
+             .option("cloudFiles.format",        "text")   # read as raw text
              .option("cloudFiles.schemaLocation",
                      "dbfs:/checkpoints/bronze/sanctions/schema")
-             .option("cloudFiles.inferColumnTypes", "false")
-             .option("multiLine",                   "true")
-             .schema(SANCTIONS_ENVELOPE_SCHEMA)
+             .option("wholetext",                "true")   # one row per file
              .load(SANCTIONS_LANDING_PATH)
              .withColumn("source_file",
                  F.col("_metadata.file_path"))
@@ -72,27 +71,30 @@ def sanctions_raw():
                  F.col("_metadata.file_modification_time"))
     )
 
-    return (
+    parsed = (
         raw_stream
-        .withColumn("record", F.explode("records"))
-        .select(
-            F.col("record.entity_id").alias("entity_id"),
-            F.col("record.entity_type").alias("entity_type"),
-            F.col("record.full_name").alias("full_name"),
-            F.col("record.aliases").alias("aliases"),
-            F.col("record.country_of_origin").alias("country_of_origin"),
-            F.col("record.sanctions_program").alias("sanctions_program"),
-            F.col("record.listed_date").alias("listed_date"),
-            F.col("record.last_updated").alias("last_updated"),
-            F.col("record.is_active").alias("is_active"),
-            F.col("record.risk_score").alias("risk_score"),
-            F.col("record.source_list").alias("source_list"),
-            F.col("source_file"),
-            F.col("source_file_modified_ts"),
-            F.current_timestamp().alias("ingestion_ts"),
-            F.to_date(F.current_timestamp()).alias("ingestion_date"),
-            F.lit("1.0.0").alias("pipeline_version"),
-        )
+        .withColumn("envelope",
+            F.from_json(F.col("value"), envelope_schema))
+        .withColumn("record", F.explode("envelope.records"))
+    )
+
+    return parsed.select(
+        F.col("record.entity_id").alias("entity_id"),
+        F.col("record.entity_type").alias("entity_type"),
+        F.col("record.full_name").alias("full_name"),
+        F.col("record.aliases").alias("aliases"),
+        F.col("record.country_of_origin").alias("country_of_origin"),
+        F.col("record.sanctions_program").alias("sanctions_program"),
+        F.col("record.listed_date").alias("listed_date"),
+        F.col("record.last_updated").alias("last_updated"),
+        F.col("record.is_active").alias("is_active"),
+        F.col("record.risk_score").alias("risk_score"),
+        F.col("record.source_list").alias("source_list"),
+        F.col("source_file"),
+        F.col("source_file_modified_ts"),
+        F.current_timestamp().alias("ingestion_ts"),
+        F.to_date(F.current_timestamp()).alias("ingestion_date"),
+        F.lit("1.0.0").alias("pipeline_version"),
     )
 
 @dlt.table(
