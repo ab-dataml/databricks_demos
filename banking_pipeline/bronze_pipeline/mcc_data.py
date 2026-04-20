@@ -2,7 +2,7 @@ import dlt
 from pyspark.sql import functions as F
 from pyspark.sql.types import (
     StructType, StructField,
-    StringType, DateType, BooleanType
+    StringType, DateType, BooleanType, ArrayType
 )
 
 MCC_LANDING_PATH       = "s3://fraud-demo-bucket-043309328060-us-east-1-an/reference/mcc_codes/"
