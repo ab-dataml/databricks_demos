@@ -123,59 +123,104 @@ def market_data_quarantine():
 def market_data_audit():
     import json
     from datetime import datetime, timezone
+    from pyspark.sql.window import Window
+    from pyspark.sql.types import (
+        StructType, StructField, LongType,
+        DoubleType, StringType, TimestampType, BooleanType
+    )
 
     raw        = dlt.read("market_data_raw")
     parsed     = dlt.read("market_data_parsed")
     quarantine = dlt.read("market_data_quarantine")
 
-    total    = raw.count()
-    good     = parsed.count()
-    bad      = quarantine.count()
-    q_rate   = round(bad / total * 100, 4) if total > 0 else 0.0
+    # ── single collect for all scalar metrics ─────────────────
+    counts = (
+        raw.agg(F.count("*").alias("total_rows"))
+        .crossJoin(
+            parsed.agg(
+                F.count("*").alias("good_rows"),
+                F.coalesce(
+                    F.max("rate_age_minutes"),
+                    F.lit(0.0)
+                ).alias("max_rate_age_mins"),
+                F.sum(
+                    F.when(F.col("is_stale") == True, 1)
+                     .otherwise(0)
+                ).alias("stale_rate_count"),
+            )
+        )
+        .crossJoin(
+            quarantine.agg(F.count("*").alias("quarantine_rows"))
+        )
+        .withColumn(
+            "quarantine_pct",
+            F.when(
+                F.col("total_rows") > 0,
+                F.round(
+                    F.col("quarantine_rows") / F.col("total_rows") * 100,
+                    4
+                )
+            ).otherwise(F.lit(0.0))
+        )
+        .withColumn(
+            "provider_stale",
+            F.col("max_rate_age_mins") > 30
+        )
+        .withColumn(
+            "audit_status",
+            F.when(
+                (F.col("total_rows") == 0) |
+                (F.col("quarantine_pct") > 5.0) |
+                (F.col("stale_rate_count") > 0),
+                F.lit("FAIL")
+            ).otherwise(F.lit("PASS"))
+        )
+    )
 
-    max_age = parsed.agg(
-        F.max("rate_age_minutes")
-    ).collect()[0][0] or 0.0
+    row = counts.collect()[0]
 
-    stale_count = parsed.filter(
-        F.col("is_stale") == True
-    ).count()
-
+    # ── rate snapshot — latest rate per currency pair ──────────
+    # toPandas unavoidable here — need a dict keyed by currency
     rate_snapshot = (
         parsed
-        .orderBy(F.desc("fetch_ts"))
-        .select("quote_currency", "rate", "rate_date")
-        .limit(len(VALID_QUOTE_CCYS))
+        .withColumn(
+            "rn",
+            F.row_number().over(
+                Window.partitionBy("quote_currency")
+                      .orderBy(F.desc("fetch_ts"))
+            )
+        )
+        .filter(F.col("rn") == 1)
+        .select(
+            F.col("quote_currency"),
+            F.round("rate", 6).alias("rate")
+        )
         .toPandas()
         .set_index("quote_currency")["rate"]
-        .round(6)
         .to_dict()
     )
 
+    # ── top failure reasons — no pandas equivalent for dict records
     top_failures = (
         quarantine
-        .groupBy("failure_reasons").count()
-        .orderBy(F.desc("count")).limit(5)
-        .toPandas().to_dict("records")
-    ) if bad > 0 else []
+        .groupBy("failure_reasons")
+        .agg(F.count("*").alias("count"))
+        .orderBy(F.desc("count"))
+        .limit(5)
+        .toPandas()
+        .to_dict("records")
+    ) if row["quarantine_rows"] > 0 else []
 
-    status = (
-        "FAIL" if total == 0 or q_rate > 5.0 or stale_count > 0
-        else "PASS"
-    )
-
-    from pyspark.sql.types import (
-        StructType, StructField, LongType,
-        DoubleType, StringType, TimestampType, BooleanType
-    )
-    schema = StructType([
+    # ── build audit schema ─────────────────────────────────────
+    audit_schema = StructType([
         StructField("run_ts",              TimestampType(), False),
         StructField("total_rows",          LongType(),      False),
         StructField("good_rows",           LongType(),      False),
         StructField("quarantine_rows",     LongType(),      False),
         StructField("quarantine_pct",      DoubleType(),    False),
-        StructField("max_rate_age_mins",   DoubleType(),    True),
+        StructField("max_rate_age_mins",   DoubleType(),    False),
         StructField("stale_rate_count",    LongType(),      False),
+        StructField("provider_stale",      BooleanType(),   False),
         StructField("rate_snapshot",       StringType(),    True),
         StructField("top_failure_reasons", StringType(),    True),
         StructField("audit_status",        StringType(),    False),
@@ -183,14 +228,15 @@ def market_data_audit():
 
     return spark.createDataFrame([{
         "run_ts":              datetime.now(timezone.utc).replace(tzinfo=None),
-        "total_rows":          total,
-        "good_rows":           good,
-        "quarantine_rows":     bad,
-        "quarantine_pct":      q_rate,
-        "max_rate_age_mins":   float(round(max_age, 2)),
-        "stale_rate_count":    stale_count,
+        "total_rows":          int(row["total_rows"]),
+        "good_rows":           int(row["good_rows"]),
+        "quarantine_rows":     int(row["quarantine_rows"]),
+        "quarantine_pct":      float(row["quarantine_pct"]),
+        "max_rate_age_mins":   float(row["max_rate_age_mins"]),
+        "stale_rate_count":    int(row["stale_rate_count"]),
+        "provider_stale":      bool(row["provider_stale"]),
         "rate_snapshot":       json.dumps(rate_snapshot),
         "top_failure_reasons": json.dumps(top_failures),
-        "audit_status":        status,
-    }], schema=schema)
+        "audit_status":        str(row["audit_status"]),
+    }], schema=audit_schema)
 
