@@ -6,9 +6,9 @@ from pyspark.sql.types import (
     TimestampType, BooleanType, DateType
 )
 
-BRONZE_SOURCE   = "fraud_demo.bronze.transactions_cleansed_stage"
-MCC_TABLE       = "fraud_demo.bronze.mcc_codes_raw"
-SANCTIONS_TABLE = "fraud_demo.bronze.sanctions_raw"
+BRONZE_SOURCE   = "banking_demo.bronze.transactions_cleansed_stage"
+MCC_TABLE       = "banking_demo.bronze.mcc_codes_raw"
+SANCTIONS_TABLE = "banking_demo.bronze.sanctions_raw"
 
 VALID_CURRENCIES = ["GBP","USD","EUR","AED","NGN","CNY","CHF","JPY","SGD"]
 VALID_TXN_TYPES  = ["PURCHASE","TRANSFER","ATM_WITHDRAWAL",
@@ -161,7 +161,7 @@ def transactions_cleansed():
 
     with_mcc = enriched.join(
         mcc_ref,
-        on  = "merchant_mcc",
+        on  = "mcc_code",
         how = "left"
     )
 
