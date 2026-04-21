@@ -1,5 +1,6 @@
 import dlt
 from pyspark.sql import functions as F
+from pyspark.sql.window import Window
 from pyspark.sql.types import (
     StructType, StructField,
     StringType, DoubleType, IntegerType,
@@ -108,22 +109,19 @@ def transactions_cleansed():
         .dropDuplicates(["txn_id", "event_ts"])
     )
 
-    fx_rates = {
-        "GBP": 1.0000,
-        "USD": 0.7840,
-        "EUR": 0.8590,
-        "AED": 0.2134,
-        "NGN": 0.0005,
-        "CNY": 0.1082,
-        "CHF": 0.8820,
-        "JPY": 0.0052,
-        "SGD": 0.5810,
-    }
-
-    fx_expr = F.create_map(
-        *[v for pair in
-          [(F.lit(k), F.lit(v)) for k, v in fx_rates.items()]
-          for v in pair]
+    fx_rates = (
+        spark.read
+             .table("banking_demo.silver.fx_rates_pivoted")
+             .withColumn(
+                 "rn",
+                 F.row_number().over(
+                     Window.partitionBy("rate_date")
+                           .orderBy(F.desc("fetch_ts"))
+                 )
+             )
+             .filter(F.col("rn") == 1)
+             .drop("rn", "fetch_ts", "base_currency", "silver_processed_ts", "pipeline_version")
+             .withColumnRenamed("rate_date", "event_date")
     )
 
     enriched = (
@@ -134,13 +132,22 @@ def transactions_cleansed():
             F.col("amount").cast(DoubleType()))
         .withColumn("is_international",
             F.col("is_international").cast(BooleanType()))
-        .withColumn("gbp_amount",
-            F.round(
-                F.col("amount") * fx_expr[F.col("currency")],
-                2
-            ))
         .withColumn("event_date",
             F.to_date("event_ts"))
+        .join(fx_rates, on="event_date", how="left")
+        .withColumn("gbp_amount",
+            F.round(
+                F.when(F.col("currency") == "GBP", F.col("amount"))
+                 .when(F.col("currency") == "USD", F.col("amount") * F.col("GBP_USD"))
+                 .when(F.col("currency") == "EUR", F.col("amount") * F.col("GBP_EUR"))
+                 .when(F.col("currency") == "AED", F.col("amount") * F.col("GBP_AED"))
+                 .when(F.col("currency") == "NGN", F.col("amount") * F.col("GBP_NGN"))
+                 .when(F.col("currency") == "CNY", F.col("amount") * F.col("GBP_CNY"))
+                 .when(F.col("currency") == "CHF", F.col("amount") * F.col("GBP_CHF"))
+                 .when(F.col("currency") == "JPY", F.col("amount") * F.col("GBP_JPY"))
+                 .when(F.col("currency") == "SGD", F.col("amount") * F.col("GBP_SGD")),
+                2
+            ))
         .withColumn("txn_hour",
             F.hour("event_ts").cast(IntegerType()))
         .withColumn("txn_day_of_week",
@@ -161,7 +168,7 @@ def transactions_cleansed():
 
     with_mcc = enriched.join(
         mcc_ref,
-        on  = "mcc_code",
+        on  = enriched["merchant_mcc"] == mcc_ref["mcc_code"],
         how = "left"
     )
 
@@ -233,9 +240,9 @@ def transactions_silver_quarantine():
              .withColumn("quarantine_layer",  F.lit("silver"))
              .withColumn("quarantine_ts",     F.current_timestamp())
              .withColumn("quarantine_status", F.lit("PENDING_REVIEW"))
-    )    
-
-
+    )   
+    
+     
 @dlt.table(
     name    = "transactions_silver_audit",
     comment = "Silver quality metrics per pipeline run",
@@ -244,52 +251,85 @@ def transactions_silver_quarantine():
 def transactions_silver_audit():
     import json
     from datetime import datetime, timezone
-
-    silver     = dlt.read("transactions_cleansed")
-    quarantine = dlt.read("transactions_silver_quarantine")
-
-    total      = silver.count()
-    bad        = quarantine.count()
-    q_rate     = round(bad / total * 100, 4) if total > 0 else 0.0
-
-    sanctioned_count = silver.filter(
-        F.col("counterparty_sanctioned") == True).count()
-
-    high_risk_count = silver.filter(
-        F.col("is_high_risk_merchant") == True).count()
-
-    cross_border_count = silver.filter(
-        F.col("is_cross_border") == True).count()
-
-    total_gbp_volume = silver.agg(
-        F.round(F.sum("gbp_amount"), 2)
-    ).collect()[0][0] or 0.0
-
-    channel_dist = (
-        silver.groupBy("channel").count()
-              .toPandas()
-              .set_index("channel")["count"]
-              .to_dict()
-    )
-
-    top_failures = (
-        quarantine.groupBy("failure_reasons").count()
-        .orderBy(F.desc("count")).limit(5)
-        .toPandas().to_dict("records")
-    ) if bad > 0 else []
-
-    status = (
-        "FAIL" if total == 0
-                  or q_rate > 5.0
-                  or sanctioned_count > 0
-        else "PASS"
-    )
-
     from pyspark.sql.types import (
         StructType, StructField, LongType,
         DoubleType, StringType, TimestampType
     )
-    schema = StructType([
+
+    silver     = dlt.read("transactions_cleansed")
+    quarantine = dlt.read("transactions_silver_quarantine")
+
+    # ── single collect for all scalar metrics ─────────────────
+    counts = (
+        silver.agg(
+            F.count("*").alias("total_rows"),
+            F.coalesce(
+                F.round(F.sum("gbp_amount"), 2),
+                F.lit(0.0)
+            ).alias("total_gbp_volume"),
+            F.sum(
+                F.when(F.col("counterparty_sanctioned") == True, 1)
+                .otherwise(0)
+            ).alias("sanctioned_count"),
+            F.sum(
+                F.when(F.col("is_high_risk_merchant") == True, 1)
+                .otherwise(0)
+            ).alias("high_risk_count"),
+            F.sum(
+                F.when(F.col("is_cross_border") == True, 1)
+                .otherwise(0)
+            ).alias("cross_border_count"),
+        )
+        .crossJoin(
+            quarantine.agg(F.count("*").alias("quarantine_rows"))
+        )
+        .withColumn(
+            "quarantine_pct",
+            F.when(
+                F.col("total_rows") > 0,
+                F.round(
+                    F.col("quarantine_rows") / F.col("total_rows") * 100,
+                    4
+                )
+            ).otherwise(F.lit(0.0))
+        )
+        .withColumn(
+            "audit_status",
+            F.when(
+                (F.col("total_rows") == 0) |
+                (F.col("quarantine_pct") > 5.0) |
+                (F.col("sanctioned_count") > 0),
+                F.lit("FAIL")
+            ).otherwise(F.lit("PASS"))
+        )
+    )
+
+    row = counts.collect()[0]
+
+    # ── channel distribution — needs dict, toPandas unavoidable ─
+    channel_dist = (
+        silver
+        .groupBy("channel")
+        .agg(F.count("*").alias("count"))
+        .orderBy(F.desc("count"))
+        .toPandas()
+        .set_index("channel")["count"]
+        .to_dict()
+    )
+
+    # ── top failures — needs list of dicts, toPandas unavoidable ─
+    top_failures = (
+        quarantine
+        .groupBy("failure_reasons")
+        .agg(F.count("*").alias("count"))
+        .orderBy(F.desc("count"))
+        .limit(5)
+        .toPandas()
+        .to_dict("records")
+    ) if row["quarantine_rows"] > 0 else []
+
+    # ── build audit row ────────────────────────────────────────
+    audit_schema = StructType([
         StructField("run_ts",              TimestampType(), False),
         StructField("total_rows",          LongType(),      False),
         StructField("quarantine_rows",     LongType(),      False),
@@ -305,14 +345,14 @@ def transactions_silver_audit():
 
     return spark.createDataFrame([{
         "run_ts":              datetime.now(timezone.utc).replace(tzinfo=None),
-        "total_rows":          total,
-        "quarantine_rows":     bad,
-        "quarantine_pct":      q_rate,
-        "sanctioned_count":    sanctioned_count,
-        "high_risk_count":     high_risk_count,
-        "cross_border_count":  cross_border_count,
-        "total_gbp_volume":    float(total_gbp_volume),
+        "total_rows":          int(row["total_rows"]),
+        "quarantine_rows":     int(row["quarantine_rows"]),
+        "quarantine_pct":      float(row["quarantine_pct"]),
+        "sanctioned_count":    int(row["sanctioned_count"]),
+        "high_risk_count":     int(row["high_risk_count"]),
+        "cross_border_count":  int(row["cross_border_count"]),
+        "total_gbp_volume":    float(row["total_gbp_volume"]),
         "channel_dist":        json.dumps(channel_dist),
         "top_failure_reasons": json.dumps(top_failures),
-        "audit_status":        status,
-    }], schema=schema)
+        "audit_status":        str(row["audit_status"]),
+    }], schema=audit_schema)
