@@ -1,0 +1,20 @@
+resources:
+  pipelines:
+    bronze_pipeline:
+      name: bronze_pipeline
+      libraries:
+        - glob:
+            include: ../../banking_pipeline/bronze_pipeline/transactions_data.py
+        - glob:
+            include: ../../banking_pipeline/bronze_pipeline/market_data.py
+        - glob:
+            include: ../../banking_pipeline/bronze_pipeline/mcc_data.py
+        - glob:
+            include: ../../banking_pipeline/bronze_pipeline/sanctions_data.py
+      catalog: banking_demo
+      channel: CURRENT
+      continuous: false
+      photon: true
+      root_path: ../../banking_pipeline
+      schema: bronze
+      serverless: true

@@ -1,0 +1,14 @@
+resources:
+  pipelines:
+    gold_pipeline:
+      name: gold_pipeline
+      libraries:
+        - glob:
+            include: ../../banking_pipeline/gold_pipeline/transformations/**
+      catalog: banking_demo
+      channel: CURRENT
+      continuous: false
+      photon: true
+      root_path: ../../banking_pipeline
+      schema: gold
+      serverless: true

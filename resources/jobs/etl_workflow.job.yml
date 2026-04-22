@@ -1,0 +1,80 @@
+resources:
+  jobs:
+    etl_workflow:
+      name: etl_workflow
+      tasks:
+        - task_key: fetch_fx_data
+          existing_cluster_id: 0415-202838-vmscd0l0
+          email_notifications: {}
+          notebook_task:
+            notebook_path: ../../banking_pipeline/dgp/fetch_fx_data.ipynb
+            source: WORKSPACE
+          run_if: ALL_SUCCESS
+          timeout_seconds: 0
+          webhook_notifications: {}
+        - task_key: generate_mcc_files
+          existing_cluster_id: 0415-202838-vmscd0l0
+          email_notifications: {}
+          notebook_task:
+            notebook_path: ../../banking_pipeline/dgp/populate_mcc.ipynb
+            source: WORKSPACE
+          run_if: ALL_SUCCESS
+          timeout_seconds: 0
+          webhook_notifications: {}
+        - task_key: generate_sanction_files
+          existing_cluster_id: 0415-202838-vmscd0l0
+          email_notifications: {}
+          notebook_task:
+            notebook_path: ../../banking_pipeline/dgp/populate_sanction.ipynb
+            source: WORKSPACE
+          run_if: ALL_SUCCESS
+          timeout_seconds: 0
+          webhook_notifications: {}
+        - task_key: generate_txn_source
+          existing_cluster_id: 0415-202838-vmscd0l0
+          email_notifications: {}
+          notebook_task:
+            notebook_path: ../../banking_pipeline/dgp/generate_txns.ipynb
+            source: WORKSPACE
+          run_if: ALL_SUCCESS
+          timeout_seconds: 0
+          webhook_notifications: {}
+        - task_key: bronze_pipeline
+          depends_on:
+            - task_key: generate_txn_source
+            - task_key: fetch_fx_data
+            - task_key: generate_mcc_files
+            - task_key: generate_sanction_files
+          email_notifications: {}
+          pipeline_task:
+            full_refresh: false
+            pipeline_id: 9aa350f1-8b1d-4548-8577-10bffc39af9c
+          run_if: ALL_SUCCESS
+          timeout_seconds: 0
+          webhook_notifications: {}
+        - task_key: silver
+          depends_on:
+            - task_key: bronze_pipeline
+          email_notifications: {}
+          pipeline_task:
+            full_refresh: false
+            pipeline_id: 33a7f53e-9119-460e-8b43-ec3dd72bc5ed
+          run_if: ALL_SUCCESS
+          timeout_seconds: 0
+          webhook_notifications: {}
+        - task_key: gold
+          depends_on:
+            - task_key: silver
+          email_notifications: {}
+          pipeline_task:
+            pipeline_id: 7a8c376e-3002-4430-831d-a7d7deae4a10
+          run_if: ALL_SUCCESS
+          timeout_seconds: 0
+      email_notifications:
+        no_alert_for_skipped_runs: false
+      max_concurrent_runs: 1
+      performance_target: PERFORMANCE_OPTIMIZED
+      queue:
+        enabled: true
+      timeout_seconds: 0
+      webhook_notifications: {}

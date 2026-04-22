@@ -1,0 +1,46 @@
+# This is a Databricks asset bundle definition for databricks_demos.
+# The Databricks extension requires databricks.yml configuration file.
+# See https://docs.databricks.com/dev-tools/bundles/index.html for documentation.
+
+bundle:
+  name: banking-pipeline
+
+workspace:
+  host: https://dbc-0e48714d-53c3.cloud.databricks.com/
+
+targets:
+  dev:
+    mode: development
+    default: true
+    workspace:
+      root_path: ~/.bundle/${bundle.name}/${bundle.target}
+
+variables:
+  catalog:
+    default: banking_demo
+    description: Unity Catalog catalog name
+  bronze_schema:
+    default: bronze
+    description: Bronze layer schema
+  silver_schema:
+    default: silver
+    description: Silver layer schema
+  gold_schema:
+    default: gold
+    description: Gold layer schema
+  environment:
+    default: dev
+    description: Pipeline environment flag
+  notification_email:
+    default: andrew.gm.bennett@gmail.com
+    description: Pipeline failure email
+
+include:
+  - resources/pipelines/*.yml
+  - resources/jobs/*.yml
+
+  ## Optionally, there could be 'staging' or 'prod' targets here.
+  #
+  # prod:
+  #   workspace:
+  #     host: https://dbc-0e48714d-53c3.cloud.databricks.com

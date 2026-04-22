@@ -1,0 +1,14 @@
+resources:
+  pipelines:
+    silver_pipeline:
+      name: silver_pipeline
+      libraries:
+        - glob:
+            include: ../../banking_pipeline/silver_pipeline/transformations/**
+      catalog: banking_demo
+      channel: CURRENT
+      continuous: false
+      photon: true
+      root_path: ../../banking_pipeline
+      schema: silver
+      serverless: true
